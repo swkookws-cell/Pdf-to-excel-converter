@@ -161,6 +161,7 @@ export default function App() {
 
 [
   {
+    "pageNumber": 1,
     "startDate": "YYYY-MM-DD",
     "endDate": "YYYY-MM-DD",
     "days": "734",
@@ -177,7 +178,12 @@ export default function App() {
   }
 ]
 
-각 페이지의 표에서 보이는 모든 경력 항목을 빠짐없이 추출하세요. 페이지 끝에서 다음 페이지로 이어지는 항목은 한 번만 추출합니다(중복 방지). JSON 배열만 출력하세요.`;
+매우 중요한 규칙:
+1. 마지막 페이지를 제외한 모든 페이지에는 정확히 **6개의 경력 항목**이 있습니다. 누락하지 말고 모두 추출하세요. 만약 6개 미만이 보인다면 표를 다시 한 번 자세히 살펴보세요.
+2. 마지막 페이지는 6개 미만일 수 있습니다 (남은 항목 수만큼).
+3. 각 항목에 "pageNumber" 필드를 추가해서 그 항목이 어느 페이지에서 추출되었는지 명시하세요 (정수, 예: 1, 2, 3).
+4. 페이지 헤더("성명", "Page : N / N", "1. 기술경력")는 항목이 아닙니다. 표의 데이터 행만 항목으로 카운트하세요.
+5. JSON 배열만 출력하세요. 설명이나 주석 절대 금지.`;
 
     // Gemini API 호출 형식: parts 배열 안에 inline_data와 text를 함께 넣음
     // 시스템 프롬프트는 별도 필드(systemInstruction)로 전달
@@ -267,6 +273,7 @@ export default function App() {
     }
     const parsed = JSON.parse(arrMatch[0]);
     return parsed.map(r => ({
+      pageNumber: r.pageNumber || null, // 어느 페이지에서 추출됐는지
       startDate: r.startDate || '',
       endDate: r.endDate || '',
       days: r.days || '',
@@ -280,7 +287,8 @@ export default function App() {
       responsibility: r.responsibility || '',
       amount: r.amount || '',
       note: '',
-      rawBlock: ''
+      rawBlock: '',
+      isEmpty: false // 빈 행 여부 (검증 후 채워진 행은 true)
     }));
   };
 
@@ -362,63 +370,182 @@ export default function App() {
       setPageThumbnails(thumbs);
 
       // 2단계: Gemini Vision으로 페이지 묶음 단위 추출
+      // 검증 규칙: 마지막 페이지를 제외한 모든 페이지는 정확히 6건이어야 함
+      // 부족하면 같은 청크를 자동 재시도 (최대 2회), 그래도 부족하면 빈 행으로 채움
       setStage('extracting');
       let allRecords = [];
-      const failedBatches = []; // 실패한 청크 추적 (자동 재시도용)
+      const failedBatches = []; // 완전 실패한 청크 (예외 발생)
+      const incompleteBatches = []; // 추출은 됐는데 건수 부족한 청크
       const totalCalls = Math.ceil(pageImages.length / pagesPerCall);
+      const EXPECTED_PER_PAGE = 6;
+      const lastPageNum = pageImages[pageImages.length - 1].page;
+
+      // 청크별로 기대되는 건수 계산 (마지막 페이지가 포함되면 마지막 페이지의 건수는 알 수 없음)
+      const computeExpected = (batch) => {
+        const containsLast = batch.some(p => p.page === lastPageNum);
+        if (containsLast) {
+          // 마지막 페이지를 제외한 페이지들만 6건씩 보장 (마지막은 0~6건 가능)
+          return (batch.length - 1) * EXPECTED_PER_PAGE; // 최소 기대치
+        }
+        return batch.length * EXPECTED_PER_PAGE;
+      };
+
+      // 청크 추출 (재시도 포함) — 부족하면 LLM에 한 번 더 호출
+      const extractWithRetry = async (batch, startPageNum, endPageNum) => {
+        const expected = computeExpected(batch);
+        const containsLast = batch.some(p => p.page === lastPageNum);
+        const maxAttempts = 3; // 첫 시도 + 재시도 2회
+
+        let bestRecords = [];
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          if (cancelRef.current) break;
+          const records = await extractPagesWithClaude(batch, startPageNum);
+          if (records.length > bestRecords.length) bestRecords = records; // 가장 많이 추출된 결과 보존
+
+          // 마지막 페이지 포함이면 expected는 최소치라서 records.length >= expected이면 OK
+          // 아니면 records.length === batch.length * 6이어야 OK
+          const isOK = containsLast
+            ? records.length >= expected // 마지막 페이지 0건도 가능하므로 >= 사용
+            : records.length === batch.length * EXPECTED_PER_PAGE;
+
+          if (isOK) {
+            return { records, finalAttempts: attempt };
+          }
+
+          if (attempt < maxAttempts) {
+            addLog(`⚠ 페이지 ${startPageNum}-${endPageNum}: ${records.length}건 추출 (예상 ${batch.length * EXPECTED_PER_PAGE}건). 재시도 (${attempt}/${maxAttempts - 1})...`, 'info');
+            await new Promise(r => setTimeout(r, 3000));
+          }
+        }
+        return { records: bestRecords, finalAttempts: maxAttempts };
+      };
+
       for (let ci = 0; ci < totalCalls; ci++) {
         if (cancelRef.current) { addLog('중단됨', 'error'); break; }
         const startIdx = ci * pagesPerCall;
         const batch = pageImages.slice(startIdx, startIdx + pagesPerCall);
         const startPageNum = batch[0].page;
         const endPageNum = batch[batch.length - 1].page;
+        const containsLast = batch.some(p => p.page === lastPageNum);
+        const targetCount = batch.length * EXPECTED_PER_PAGE;
+
         setProgress({
           current: ci + 1, total: totalCalls,
           label: `Gemini Vision 추출 (${ci + 1}/${totalCalls}회 · 페이지 ${startPageNum}-${endPageNum})`
         });
+
         try {
           const t0 = performance.now();
-          const records = await extractPagesWithClaude(batch, startPageNum);
+          const { records, finalAttempts } = await extractWithRetry(batch, startPageNum, endPageNum);
           const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-          addLog(`페이지 ${startPageNum}-${endPageNum}: ${records.length}건 추출, ${elapsed}초`, 'success');
+
+          // 추출된 records에 pageNumber가 누락된 경우 청크 첫 페이지로 일단 채워둠
+          records.forEach(r => { if (!r.pageNumber) r.pageNumber = startPageNum; });
+
           allRecords.push(...records);
+
+          if (containsLast) {
+            addLog(`페이지 ${startPageNum}-${endPageNum} (마지막 포함): ${records.length}건 추출, ${elapsed}초`, 'success');
+          } else if (records.length === targetCount) {
+            addLog(`페이지 ${startPageNum}-${endPageNum}: ${records.length}/${targetCount}건 ✓ (${finalAttempts}회 시도, ${elapsed}초)`, 'success');
+          } else {
+            addLog(`페이지 ${startPageNum}-${endPageNum}: ${records.length}/${targetCount}건 (재시도 후에도 부족). 빈 행으로 채움.`, 'error');
+            incompleteBatches.push({ batch, startPageNum, endPageNum, actualCount: records.length, expectedCount: targetCount });
+          }
         } catch (e) {
-          addLog(`페이지 ${startPageNum}-${endPageNum} 추출 실패: ${e.message}`, 'error');
+          addLog(`페이지 ${startPageNum}-${endPageNum} 추출 완전 실패: ${e.message}`, 'error');
           failedBatches.push({ batch, startPageNum, endPageNum });
         }
       }
 
-      // 실패한 청크 자동 재시도 (1회) — 보통 503은 잠깐 후 풀림
+      // 완전 실패한 청크 자동 재시도 (네트워크/503 등 예외)
       if (failedBatches.length > 0 && !cancelRef.current) {
-        addLog(`실패한 ${failedBatches.length}개 청크를 30초 후 자동 재시도합니다...`, 'info');
+        addLog(`완전 실패한 ${failedBatches.length}개 청크를 30초 후 자동 재시도합니다...`, 'info');
         await new Promise(r => setTimeout(r, 30000));
         if (!cancelRef.current) {
           for (let i = 0; i < failedBatches.length; i++) {
             if (cancelRef.current) break;
             const { batch, startPageNum, endPageNum } = failedBatches[i];
+            const targetCount = batch.length * EXPECTED_PER_PAGE;
+            const containsLast = batch.some(p => p.page === lastPageNum);
             setProgress({
               current: i + 1, total: failedBatches.length,
               label: `실패 청크 재시도 (${i + 1}/${failedBatches.length} · 페이지 ${startPageNum}-${endPageNum})`
             });
             try {
-              const records = await extractPagesWithClaude(batch, startPageNum);
-              addLog(`재시도 성공 페이지 ${startPageNum}-${endPageNum}: ${records.length}건`, 'success');
+              const { records } = await extractWithRetry(batch, startPageNum, endPageNum);
+              records.forEach(r => { if (!r.pageNumber) r.pageNumber = startPageNum; });
               allRecords.push(...records);
+              addLog(`재시도 결과 페이지 ${startPageNum}-${endPageNum}: ${records.length}건`, 'success');
+              if (!containsLast && records.length < targetCount) {
+                incompleteBatches.push({ batch, startPageNum, endPageNum, actualCount: records.length, expectedCount: targetCount });
+              }
             } catch (e) {
-              addLog(`재시도 실패 페이지 ${startPageNum}-${endPageNum}: ${e.message}. 수동으로 다시 변환하세요.`, 'error');
+              addLog(`재시도 실패 페이지 ${startPageNum}-${endPageNum}: ${e.message}. 빈 행으로 채웁니다.`, 'error');
+              incompleteBatches.push({ batch, startPageNum, endPageNum, actualCount: 0, expectedCount: batch.length * EXPECTED_PER_PAGE });
             }
           }
         }
       }
 
-      // 중복 제거 (페이지 경계 중복)
+      // 빈 행 채우기 안내 (실제 채우기는 페이지별 그룹화 후 처리)
+      if (incompleteBatches.length > 0) {
+        const totalEmpty = incompleteBatches.reduce((s, b) => s + (b.expectedCount - b.actualCount), 0);
+        addLog(`⚠ 부족한 ${incompleteBatches.length}개 청크에 총 ${totalEmpty}개 빈 행을 채워 6건/페이지를 맞춥니다.`, 'info');
+      }
+
+      // 중복 제거 (페이지 경계 중복) — 단, 모든 필드가 비어있으면 중복 검사 제외
       const seen = new Set();
       allRecords = allRecords.filter(r => {
         const key = `${r.startDate}|${r.endDate}|${r.projectName}`;
+        // 빈 키는 중복 검사 제외 (LLM이 비어있는 행을 잘못 추출한 경우, 일단 통과시키고 6건 보정 단계에서 처리)
+        if (key === '||' || (!r.startDate && !r.endDate && !r.projectName)) return true;
         if (seen.has(key)) return false;
         seen.add(key); return true;
       });
       addLog(`총 ${allRecords.length}건 추출 (중복 제거 후)`, 'success');
+
+      // 페이지별 6건 보정: 마지막 페이지를 제외한 모든 페이지가 정확히 6건이 되도록 빈 행 추가
+      const numPages = pageImages.length;
+      const recordsByPage = new Map();
+      for (let p = 1; p <= numPages; p++) recordsByPage.set(p, []);
+      for (const r of allRecords) {
+        const pn = r.pageNumber || 1;
+        const safePage = Math.max(1, Math.min(numPages, pn));
+        if (!recordsByPage.has(safePage)) recordsByPage.set(safePage, []);
+        recordsByPage.get(safePage).push(r);
+      }
+
+      const makeEmptyRecord = (pageNum) => ({
+        pageNumber: pageNum,
+        startDate: '', endDate: '', days: '',
+        projectName: '', owner: '', overview: '',
+        constructionType: '', specialty: '', duty: '', position: '',
+        responsibility: '', amount: '',
+        note: '', rawBlock: '',
+        isEmpty: true
+      });
+
+      // 페이지 순서대로 다시 합치면서 부족한 곳에 빈 행 추가
+      const balancedRecords = [];
+      let totalAddedEmpty = 0;
+      for (let p = 1; p <= numPages; p++) {
+        const pageRecs = recordsByPage.get(p) || [];
+        balancedRecords.push(...pageRecs);
+        const isLastPage = p === numPages;
+        if (!isLastPage && pageRecs.length < EXPECTED_PER_PAGE) {
+          const need = EXPECTED_PER_PAGE - pageRecs.length;
+          for (let k = 0; k < need; k++) {
+            balancedRecords.push(makeEmptyRecord(p));
+          }
+          totalAddedEmpty += need;
+          addLog(`페이지 ${p}: ${pageRecs.length}건 → 빈 행 ${need}개 추가하여 6건으로 보정`, 'info');
+        }
+      }
+      if (totalAddedEmpty > 0) {
+        addLog(`총 ${totalAddedEmpty}개 빈 행 추가됨. 최종 ${balancedRecords.length}건`, 'success');
+      }
+      allRecords = balancedRecords;
 
       // 3단계: 코드 매핑
       setStage('mapping');
@@ -803,6 +930,9 @@ export default function App() {
                 <h3 className="text-sm font-semibold text-stone-900">변환 결과</h3>
                 <p className="text-xs text-stone-500 mt-0.5 number-tabular">
                   총 {extractedRecords.length}건 · 자동 매칭 {extractedRecords.filter(r => r.ownerCode || r.dutyCode || r.positionCode).length}건
+                  {extractedRecords.filter(r => r.isEmpty).length > 0 && (
+                    <span className="text-amber-700 ml-2">· 빈 행 {extractedRecords.filter(r => r.isEmpty).length}개 (재시도 후에도 추출 실패)</span>
+                  )}
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -830,12 +960,21 @@ export default function App() {
                 <tbody className="divide-y divide-stone-100">
                   {extractedRecords.map((r, idx) => (
                     <React.Fragment key={idx}>
-                      <tr className="hover:bg-stone-50">
-                        <td className="px-3 py-2.5 text-stone-400 number-tabular">{idx + 1}</td>
+                      <tr className={r.isEmpty ? "bg-amber-50/40 hover:bg-amber-50" : "hover:bg-stone-50"}>
+                        <td className="px-3 py-2.5 text-stone-400 number-tabular">
+                          {idx + 1}
+                          {r.isEmpty && <div className="text-[9px] text-amber-700 font-medium mt-0.5">빈 행</div>}
+                        </td>
                         <td className="px-3 py-2.5 number-tabular text-stone-700 whitespace-nowrap">
-                          <div>{r.startDate}</div>
-                          <div className="text-stone-400">{r.endDate}</div>
-                          {r.days && <div className="text-stone-400 text-[10px]">{r.days}일</div>}
+                          {r.isEmpty ? (
+                            <div className="text-amber-600 text-[10px]">⚠ 추출 실패<br/>(p.{r.pageNumber})</div>
+                          ) : (
+                            <>
+                              <div>{r.startDate}</div>
+                              <div className="text-stone-400">{r.endDate}</div>
+                              {r.days && <div className="text-stone-400 text-[10px]">{r.days}일</div>}
+                            </>
+                          )}
                         </td>
                         <td className="px-3 py-2.5 max-w-xs">
                           <div className="text-stone-900 font-medium truncate" title={r.projectName}>{r.projectName || <span className="text-stone-300">―</span>}</div>
