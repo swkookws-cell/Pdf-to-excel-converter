@@ -192,33 +192,62 @@ export default function App() {
       throw new Error('Google Gemini API 키가 설정되지 않았습니다. 상단의 API 키 입력란을 확인하세요.');
     }
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`;
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: sysPrompt }] },
-        contents: [{ role: 'user', parts }],
-        generationConfig: {
-          temperature: 0.1, // 정확한 추출을 위해 낮은 temperature
-          maxOutputTokens: 8000,
-          responseMimeType: 'application/json', // JSON 모드 강제
-        }
-      })
+    const requestBody = JSON.stringify({
+      systemInstruction: { parts: [{ text: sysPrompt }] },
+      contents: [{ role: 'user', parts }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 8000,
+        responseMimeType: 'application/json',
+      }
     });
 
+    // 자동 재시도 로직: 503/429/500 등 일시적 에러는 지수 백오프로 재시도
+    const maxRetries = 3;
+    const retryDelays = [5000, 10000, 20000]; // 5초, 10초, 20초
+    let response;
+    let lastError = '';
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: requestBody
+      });
+
+      if (response.ok) break; // 성공이면 루프 탈출
+
+      const errText = await response.text();
+      lastError = errText;
+      const isRetryable = [429, 500, 502, 503, 504].includes(response.status);
+
+      if (!isRetryable || attempt === maxRetries) {
+        // 재시도 불가능한 에러이거나 마지막 시도이면 에러 발생
+        if (response.status === 429) {
+          throw new Error(`Gemini API 한도 초과 (분당/일일 한도). 잠시 후 다시 시도하거나 다른 모델로 변경하세요. ${errText.slice(0, 200)}`);
+        }
+        if (response.status === 400 && errText.includes('API key')) {
+          throw new Error(`Gemini API 키가 유효하지 않습니다. aistudio.google.com에서 새 키를 발급받으세요.`);
+        }
+        if (response.status === 503) {
+          throw new Error(`Gemini ${geminiModel} 모델이 현재 매우 혼잡합니다. 다른 모델(Flash-Lite 등)로 변경하거나 5-10분 후 다시 시도하세요.`);
+        }
+        throw new Error(`Gemini API ${response.status}: ${errText.slice(0, 300)}`);
+      }
+
+      // 재시도 가능한 에러 → 잠시 기다렸다가 재시도
+      const delay = retryDelays[attempt];
+      addLog(`⚠ Gemini ${response.status} 에러. ${delay/1000}초 후 재시도 (${attempt + 1}/${maxRetries})...`, 'info');
+      await new Promise(r => setTimeout(r, delay));
+      // 사용자가 중단 버튼 눌렀으면 더 시도하지 않음
+      if (cancelRef.current) throw new Error('사용자가 중단했습니다.');
+    }
+
     if (!response.ok) {
-      const err = await response.text();
-      // Rate limit (429) 시 친절한 메시지
-      if (response.status === 429) {
-        throw new Error(`Gemini API 한도 초과 (분당/일일 한도). 잠시 후 다시 시도하거나 다른 모델로 변경하세요. ${err.slice(0, 200)}`);
-      }
-      if (response.status === 400 && err.includes('API key')) {
-        throw new Error(`Gemini API 키가 유효하지 않습니다. aistudio.google.com에서 새 키를 발급받으세요.`);
-      }
-      throw new Error(`Gemini API ${response.status}: ${err.slice(0, 300)}`);
+      throw new Error(`Gemini API ${response.status}: ${lastError.slice(0, 300)}`);
     }
     const data = await response.json();
     // Gemini 응답 구조: candidates[0].content.parts[0].text
@@ -335,6 +364,7 @@ export default function App() {
       // 2단계: Gemini Vision으로 페이지 묶음 단위 추출
       setStage('extracting');
       let allRecords = [];
+      const failedBatches = []; // 실패한 청크 추적 (자동 재시도용)
       const totalCalls = Math.ceil(pageImages.length / pagesPerCall);
       for (let ci = 0; ci < totalCalls; ci++) {
         if (cancelRef.current) { addLog('중단됨', 'error'); break; }
@@ -354,6 +384,30 @@ export default function App() {
           allRecords.push(...records);
         } catch (e) {
           addLog(`페이지 ${startPageNum}-${endPageNum} 추출 실패: ${e.message}`, 'error');
+          failedBatches.push({ batch, startPageNum, endPageNum });
+        }
+      }
+
+      // 실패한 청크 자동 재시도 (1회) — 보통 503은 잠깐 후 풀림
+      if (failedBatches.length > 0 && !cancelRef.current) {
+        addLog(`실패한 ${failedBatches.length}개 청크를 30초 후 자동 재시도합니다...`, 'info');
+        await new Promise(r => setTimeout(r, 30000));
+        if (!cancelRef.current) {
+          for (let i = 0; i < failedBatches.length; i++) {
+            if (cancelRef.current) break;
+            const { batch, startPageNum, endPageNum } = failedBatches[i];
+            setProgress({
+              current: i + 1, total: failedBatches.length,
+              label: `실패 청크 재시도 (${i + 1}/${failedBatches.length} · 페이지 ${startPageNum}-${endPageNum})`
+            });
+            try {
+              const records = await extractPagesWithClaude(batch, startPageNum);
+              addLog(`재시도 성공 페이지 ${startPageNum}-${endPageNum}: ${records.length}건`, 'success');
+              allRecords.push(...records);
+            } catch (e) {
+              addLog(`재시도 실패 페이지 ${startPageNum}-${endPageNum}: ${e.message}. 수동으로 다시 변환하세요.`, 'error');
+            }
+          }
         }
       }
 
