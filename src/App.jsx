@@ -130,60 +130,72 @@ export default function App() {
   const extractPagesWithClaude = async (pageImages, startPageNum) => {
     const sysPrompt = `당신은 한국 건설기술인협회의 "건설기술인 경력증명서" PDF에서 기술경력 항목을 추출하는 전문가입니다.
 
-경력증명서의 "1. 기술경력" 섹션은 표 형식으로 되어 있으며, 각 행은 하나의 경력 항목입니다. 각 항목은 다음 컬럼을 가집니다:
+PDF 구조:
+- 1페이지: 인적사항/근무처 등 표지 (기술경력 항목 없음)
+- 2페이지부터: "1. 기술경력" 표가 시작됨. 이 헤더 글자 아래의 표에서만 항목을 추출합니다.
+- 표 형식: | 참여기간(인정일) | 사업명/발주자/공사개요/적용공법 | 직무분야/전문분야/책임정도/적용신복합건설기술 | 담당업무/직위/공사금액/시설물종류 |
 
-| 참여기간(인정일) | 사업명 / 발주자 / 공사(용역)개요 / 적용공법 | 직무분야 / 전문분야 / 책임정도 / 적용 신·복합건설기술 | 담당업무 / 직위 / 공사(용역)금액(백만원) / 시설물 종류 |
-
-표에서 읽어야 할 핵심 정보:
-- **참여기간**: 시작일 ~ 종료일 (yyyy.mm.dd 형식), 그리고 (N일) 형식의 인정일수
+표에서 읽어야 할 핵심 정보 (각 행마다):
+- **참여기간**: 시작일 ~ 종료일 (yyyy.mm.dd 형식), 그리고 (N일) 형식의 인정일수. 이 "참여기간"이 한 항목의 시작점이며, 페이지에 있는 참여기간의 개수가 그 페이지의 항목 개수입니다.
 - **사업명**: 첫 번째 큰 글자로 적힌 공사/사업 이름 (예: "중앙선도농지하차도공사")
 - **발주자**: 사업명 아래줄 (예: "철도청", "국가철도공단")
-- **공사개요**: 발주자 다음 줄, 콤마로 연결된 시설물 키워드 (예: "교량,궤도", "노반,교량,궤도")
+- **공사개요**: 콤마로 연결된 시설물 키워드 (예: "교량,궤도", "노반,교량,궤도")
 - **직무분야**: 예 "토목", "건축", "기계"
 - **전문분야**: 예 "철도·삭도", "철도ㆍ삭도" → "철도.삭도"로 통일
-- **책임정도**: 예 "*공사감독", "공사감독", "참여기술자"
+- **책임정도**: 예 "*공사감독", "공사감독"
 - **담당업무**: 예 "감독", "사업관리", "설계"
 - **직위**: 예 "토목서기", "토목주사보", "과장"
 - **공사금액**: 숫자 (백만원 단위)
 - **시설물종류**: 예 "레일용접 (가스압접 460개소, 테르밋 252개소)"
 
 추출 규칙:
-1. 각 항목의 데이터는 표 한 행 안에 있으므로, 위에서 아래로 같은 행 안의 텍스트를 모두 같은 항목으로 묶어야 합니다.
-2. 다음 항목으로 넘어가는 기준은 새로운 "yyyy.mm.dd ~ yyyy.mm.dd" 기간이 시작될 때입니다.
-3. 페이지 헤더("성명 : ...", "Page : N / N", "1. 기술경력") 등은 무시합니다.
-4. 빈 필드는 빈 문자열 ""로 두세요. 절대 추측하지 마세요.
-5. 날짜는 반드시 YYYY-MM-DD 형식으로 변환하세요 (예: "1982.02.26" → "1982-02-26").
+1. **표지 페이지(1페이지) 또는 표가 없는 페이지는 항목 0개로 처리**합니다.
+2. **"1. 기술경력" 헤더 글자가 보이면, 그 아래부터 표 끝까지만 탐색**합니다. 헤더 위쪽의 다른 정보는 무시.
+3. 다음 항목으로 넘어가는 기준은 **새로운 "yyyy.mm.dd ~ yyyy.mm.dd" 참여기간**이 시작될 때입니다.
+4. 페이지 헤더("성명 : ...", "Page : N / N", "1. 기술경력") 등은 항목이 아닙니다.
+5. 빈 필드는 빈 문자열 ""로 두세요. 절대 추측하지 마세요.
+6. 날짜는 반드시 YYYY-MM-DD 형식으로 변환하세요 (예: "1982.02.26" → "1982-02-26").
 
-응답은 반드시 JSON 배열로만 출력하세요. 마크다운, 설명, 주석 없이 순수 JSON만.`;
+응답은 반드시 다음 JSON 객체 형식으로 출력하세요. 마크다운, 설명, 주석 없이 순수 JSON만.`;
 
-    const userText = `다음은 건설기술인 경력증명서 PDF의 페이지 ${pageImages.map((_, i) => startPageNum + i).join(', ')}입니다.
-각 페이지의 "1. 기술경력" 표에서 모든 경력 항목을 추출하여 아래 형식의 JSON 배열로 출력하세요:
+    const pageList = pageImages.map((_, i) => startPageNum + i).join(', ');
+    const userText = `다음은 건설기술인 경력증명서 PDF의 페이지 ${pageList}입니다.
 
-[
-  {
-    "pageNumber": 1,
-    "startDate": "YYYY-MM-DD",
-    "endDate": "YYYY-MM-DD",
-    "days": "734",
-    "projectName": "중앙선도농지하차도공사",
-    "owner": "철도청",
-    "overview": "교량,궤도",
-    "constructionType": "교량,궤도",
-    "specialty": "철도.삭도",
-    "duty": "감독",
-    "position": "토목서기",
-    "responsibility": "공사감독",
-    "amount": "",
-    "facilityType": ""
-  }
-]
+작업 단계:
+1. 먼저 각 페이지에서 "1. 기술경력" 헤더가 있는지 확인하고, 그 아래 표에서 **참여기간(yyyy.mm.dd ~ yyyy.mm.dd 형식)이 몇 개 있는지 정확히 카운트**하세요. 표지 페이지(보통 1페이지)는 0개입니다.
+2. 그 카운트만큼 항목을 추출하세요. 누락 없이 정확히 그 개수가 records에 들어가야 합니다.
 
-매우 중요한 규칙:
-1. 마지막 페이지를 제외한 모든 페이지에는 정확히 **6개의 경력 항목**이 있습니다. 누락하지 말고 모두 추출하세요. 만약 6개 미만이 보인다면 표를 다시 한 번 자세히 살펴보세요.
-2. 마지막 페이지는 6개 미만일 수 있습니다 (남은 항목 수만큼).
-3. 각 항목에 "pageNumber" 필드를 추가해서 그 항목이 어느 페이지에서 추출되었는지 명시하세요 (정수, 예: 1, 2, 3).
-4. 페이지 헤더("성명", "Page : N / N", "1. 기술경력")는 항목이 아닙니다. 표의 데이터 행만 항목으로 카운트하세요.
-5. JSON 배열만 출력하세요. 설명이나 주석 절대 금지.`;
+응답 형식 (JSON 객체):
+{
+  "pageStats": [
+    { "pageNumber": ${pageImages[0].page}, "periodCount": <이 페이지의 참여기간 개수, 표지면 0> }${pageImages.length > 1 ? ',\n    { "pageNumber": ' + (pageImages[0].page + 1) + ', "periodCount": <...> }' : ''}
+  ],
+  "records": [
+    {
+      "pageNumber": <어느 페이지에서 왔는지 정수>,
+      "startDate": "YYYY-MM-DD",
+      "endDate": "YYYY-MM-DD",
+      "days": "734",
+      "projectName": "중앙선도농지하차도공사",
+      "owner": "철도청",
+      "overview": "교량,궤도",
+      "constructionType": "교량,궤도",
+      "specialty": "철도.삭도",
+      "duty": "감독",
+      "position": "토목서기",
+      "responsibility": "공사감독",
+      "amount": "",
+      "facilityType": ""
+    }
+  ]
+}
+
+매우 중요:
+- pageStats의 periodCount는 그 페이지에서 실제 보이는 참여기간(날짜 ~ 날짜) 개수와 **반드시 일치**해야 합니다.
+- records 배열에서 같은 pageNumber를 가진 항목 개수가 그 페이지의 periodCount와 **반드시 일치**해야 합니다.
+- 표지(인적사항만 있는 페이지)는 periodCount: 0, records에 해당 pageNumber 없음.
+- 페이지에 참여기간이 5개면 records에서 그 페이지 항목도 5개. 6개면 6개.
+- JSON 객체만 출력하세요. 설명, 마크다운, 주석 모두 금지.`;
 
     // Gemini API 호출 형식: parts 배열 안에 inline_data와 text를 함께 넣음
     // 시스템 프롬프트는 별도 필드(systemInstruction)로 전달
@@ -266,14 +278,39 @@ export default function App() {
     }
     const text = (candidate.content?.parts || []).map(p => p.text || '').join('');
     const cleaned = text.replace(/```json\s*|\s*```/g, '').trim();
-    const arrMatch = cleaned.match(/\[[\s\S]*\]/);
-    if (!arrMatch) {
-      console.warn('Gemini response without JSON array:', text);
-      return [];
+
+    // 새 응답 형식: { pageStats: [...], records: [...] }
+    // 구버전 호환을 위해 배열만 반환된 경우도 처리
+    let parsed;
+    try {
+      // 객체 형태 시도
+      const objMatch = cleaned.match(/\{[\s\S]*\}/);
+      if (objMatch) {
+        parsed = JSON.parse(objMatch[0]);
+      } else {
+        // fallback: 배열만 있는 경우
+        const arrMatch = cleaned.match(/\[[\s\S]*\]/);
+        if (arrMatch) {
+          parsed = { pageStats: [], records: JSON.parse(arrMatch[0]) };
+        } else {
+          console.warn('Gemini response without JSON:', text);
+          return { pageStats: [], records: [] };
+        }
+      }
+    } catch (e) {
+      console.warn('JSON parse error:', e, text);
+      return { pageStats: [], records: [] };
     }
-    const parsed = JSON.parse(arrMatch[0]);
-    return parsed.map(r => ({
-      pageNumber: r.pageNumber || null, // 어느 페이지에서 추출됐는지
+
+    // pageStats와 records 정규화
+    const pageStats = Array.isArray(parsed.pageStats) ? parsed.pageStats.map(s => ({
+      pageNumber: parseInt(s.pageNumber) || 0,
+      periodCount: parseInt(s.periodCount) || 0,
+    })) : [];
+
+    const rawRecords = Array.isArray(parsed.records) ? parsed.records : (Array.isArray(parsed) ? parsed : []);
+    const records = rawRecords.map(r => ({
+      pageNumber: parseInt(r.pageNumber) || null,
       startDate: r.startDate || '',
       endDate: r.endDate || '',
       days: r.days || '',
@@ -288,8 +325,10 @@ export default function App() {
       amount: r.amount || '',
       note: '',
       rawBlock: '',
-      isEmpty: false // 빈 행 여부 (검증 후 채워진 행은 true)
+      isEmpty: false
     }));
+
+    return { pageStats, records };
   };
 
   // ==========  코드 매핑  ==========
@@ -370,54 +409,68 @@ export default function App() {
       setPageThumbnails(thumbs);
 
       // 2단계: Gemini Vision으로 페이지 묶음 단위 추출
-      // 검증 규칙: 마지막 페이지를 제외한 모든 페이지는 정확히 6건이어야 함
-      // 부족하면 같은 청크를 자동 재시도 (최대 2회), 그래도 부족하면 빈 행으로 채움
+      // 새 검증 방식: LLM이 알려주는 periodCount(페이지별 참여기간 개수)를 진실의 기준으로 사용
+      // - 페이지마다 5건 또는 6건일 수 있음 (페이지 1은 표지로 0건)
+      // - 추출된 records의 페이지별 개수 < periodCount면 같은 청크 재시도 (1회)
+      // - 재시도 후에도 부족하면 min(periodCount, 6)에 맞춰 빈 행으로 채움
       setStage('extracting');
       let allRecords = [];
       const failedBatches = []; // 완전 실패한 청크 (예외 발생)
-      const incompleteBatches = []; // 추출은 됐는데 건수 부족한 청크
       const totalCalls = Math.ceil(pageImages.length / pagesPerCall);
-      const EXPECTED_PER_PAGE = 6;
-      const lastPageNum = pageImages[pageImages.length - 1].page;
+      const MAX_PER_PAGE = 6; // 페이지당 최대 항목 수 (빈 행 채울 때 상한)
 
-      // 청크별로 기대되는 건수 계산 (마지막 페이지가 포함되면 마지막 페이지의 건수는 알 수 없음)
-      const computeExpected = (batch) => {
-        const containsLast = batch.some(p => p.page === lastPageNum);
-        if (containsLast) {
-          // 마지막 페이지를 제외한 페이지들만 6건씩 보장 (마지막은 0~6건 가능)
-          return (batch.length - 1) * EXPECTED_PER_PAGE; // 최소 기대치
-        }
-        return batch.length * EXPECTED_PER_PAGE;
-      };
+      // 페이지별로 LLM이 보고한 periodCount를 누적 (여러 청크에서 같은 페이지가 나올 수 있으니 최대값 채택)
+      const reportedPeriodCount = new Map(); // pageNumber -> periodCount
 
-      // 청크 추출 (재시도 포함) — 부족하면 LLM에 한 번 더 호출
+      // 청크 추출 (재시도 포함)
+      // 재시도 조건: 추출된 records의 페이지별 개수가 그 페이지의 periodCount보다 적은 페이지가 있을 때
       const extractWithRetry = async (batch, startPageNum, endPageNum) => {
-        const expected = computeExpected(batch);
-        const containsLast = batch.some(p => p.page === lastPageNum);
-        const maxAttempts = 3; // 첫 시도 + 재시도 2회
-
+        const batchPageNums = batch.map(p => p.page);
         let bestRecords = [];
+        let bestStats = [];
+        const maxAttempts = 2; // 첫 시도 + 재시도 1회
+
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           if (cancelRef.current) break;
-          const records = await extractPagesWithClaude(batch, startPageNum);
-          if (records.length > bestRecords.length) bestRecords = records; // 가장 많이 추출된 결과 보존
+          const { pageStats, records } = await extractPagesWithClaude(batch, startPageNum);
 
-          // 마지막 페이지 포함이면 expected는 최소치라서 records.length >= expected이면 OK
-          // 아니면 records.length === batch.length * 6이어야 OK
-          const isOK = containsLast
-            ? records.length >= expected // 마지막 페이지 0건도 가능하므로 >= 사용
-            : records.length === batch.length * EXPECTED_PER_PAGE;
+          // 더 좋은 결과(records 수가 더 많은 결과)를 보존
+          if (records.length > bestRecords.length) {
+            bestRecords = records;
+            bestStats = pageStats;
+          }
 
-          if (isOK) {
-            return { records, finalAttempts: attempt };
+          // 각 페이지의 추출 개수 vs periodCount 비교
+          const recordsByPage = new Map();
+          for (const r of records) {
+            const pn = r.pageNumber;
+            if (!pn) continue;
+            recordsByPage.set(pn, (recordsByPage.get(pn) || 0) + 1);
+          }
+
+          // 모든 페이지에서 추출 수 >= periodCount면 OK
+          let allOK = true;
+          const shortageList = [];
+          for (const stat of pageStats) {
+            const actualCount = recordsByPage.get(stat.pageNumber) || 0;
+            if (actualCount < stat.periodCount) {
+              allOK = false;
+              shortageList.push(`p.${stat.pageNumber}: ${actualCount}/${stat.periodCount}`);
+            }
+          }
+          // pageStats가 비어있다면 LLM이 형식을 안 지킨 것 — 그래도 최소한의 결과는 보존
+          if (pageStats.length === 0 && records.length > 0) allOK = true;
+
+          if (allOK) {
+            return { records: bestRecords, pageStats: bestStats, finalAttempts: attempt };
           }
 
           if (attempt < maxAttempts) {
-            addLog(`⚠ 페이지 ${startPageNum}-${endPageNum}: ${records.length}건 추출 (예상 ${batch.length * EXPECTED_PER_PAGE}건). 재시도 (${attempt}/${maxAttempts - 1})...`, 'info');
+            addLog(`⚠ 페이지 ${startPageNum}-${endPageNum} 부족 (${shortageList.join(', ')}). 재시도 (${attempt}/${maxAttempts - 1})...`, 'info');
             await new Promise(r => setTimeout(r, 3000));
           }
         }
-        return { records: bestRecords, finalAttempts: maxAttempts };
+        return { records: bestRecords, pageStats: bestStats, finalAttempts: maxAttempts };
       };
 
       for (let ci = 0; ci < totalCalls; ci++) {
@@ -426,8 +479,6 @@ export default function App() {
         const batch = pageImages.slice(startIdx, startIdx + pagesPerCall);
         const startPageNum = batch[0].page;
         const endPageNum = batch[batch.length - 1].page;
-        const containsLast = batch.some(p => p.page === lastPageNum);
-        const targetCount = batch.length * EXPECTED_PER_PAGE;
 
         setProgress({
           current: ci + 1, total: totalCalls,
@@ -436,22 +487,29 @@ export default function App() {
 
         try {
           const t0 = performance.now();
-          const { records, finalAttempts } = await extractWithRetry(batch, startPageNum, endPageNum);
+          const { records, pageStats, finalAttempts } = await extractWithRetry(batch, startPageNum, endPageNum);
           const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
 
-          // 추출된 records에 pageNumber가 누락된 경우 청크 첫 페이지로 일단 채워둠
+          // pageNumber 누락된 항목 보정
           records.forEach(r => { if (!r.pageNumber) r.pageNumber = startPageNum; });
+
+          // 페이지별 periodCount 기록 (추후 빈 행 보정에 사용)
+          for (const stat of pageStats) {
+            const prev = reportedPeriodCount.get(stat.pageNumber);
+            if (prev === undefined || stat.periodCount > prev) {
+              reportedPeriodCount.set(stat.pageNumber, stat.periodCount);
+            }
+          }
 
           allRecords.push(...records);
 
-          if (containsLast) {
-            addLog(`페이지 ${startPageNum}-${endPageNum} (마지막 포함): ${records.length}건 추출, ${elapsed}초`, 'success');
-          } else if (records.length === targetCount) {
-            addLog(`페이지 ${startPageNum}-${endPageNum}: ${records.length}/${targetCount}건 ✓ (${finalAttempts}회 시도, ${elapsed}초)`, 'success');
-          } else {
-            addLog(`페이지 ${startPageNum}-${endPageNum}: ${records.length}/${targetCount}건 (재시도 후에도 부족). 빈 행으로 채움.`, 'error');
-            incompleteBatches.push({ batch, startPageNum, endPageNum, actualCount: records.length, expectedCount: targetCount });
-          }
+          // 로그: 페이지별 추출 결과 요약
+          const summary = pageStats.map(s => {
+            const actualCount = records.filter(r => r.pageNumber === s.pageNumber).length;
+            const ok = actualCount >= s.periodCount ? '✓' : '⚠';
+            return `p.${s.pageNumber}: ${actualCount}/${s.periodCount}${ok}`;
+          }).join(', ');
+          addLog(`페이지 ${startPageNum}-${endPageNum} (${finalAttempts}회 시도, ${elapsed}초): ${summary || records.length + '건'}`, 'success');
         } catch (e) {
           addLog(`페이지 ${startPageNum}-${endPageNum} 추출 완전 실패: ${e.message}`, 'error');
           failedBatches.push({ batch, startPageNum, endPageNum });
@@ -466,46 +524,40 @@ export default function App() {
           for (let i = 0; i < failedBatches.length; i++) {
             if (cancelRef.current) break;
             const { batch, startPageNum, endPageNum } = failedBatches[i];
-            const targetCount = batch.length * EXPECTED_PER_PAGE;
-            const containsLast = batch.some(p => p.page === lastPageNum);
             setProgress({
               current: i + 1, total: failedBatches.length,
               label: `실패 청크 재시도 (${i + 1}/${failedBatches.length} · 페이지 ${startPageNum}-${endPageNum})`
             });
             try {
-              const { records } = await extractWithRetry(batch, startPageNum, endPageNum);
+              const { records, pageStats } = await extractWithRetry(batch, startPageNum, endPageNum);
               records.forEach(r => { if (!r.pageNumber) r.pageNumber = startPageNum; });
+              for (const stat of pageStats) {
+                const prev = reportedPeriodCount.get(stat.pageNumber);
+                if (prev === undefined || stat.periodCount > prev) {
+                  reportedPeriodCount.set(stat.pageNumber, stat.periodCount);
+                }
+              }
               allRecords.push(...records);
               addLog(`재시도 결과 페이지 ${startPageNum}-${endPageNum}: ${records.length}건`, 'success');
-              if (!containsLast && records.length < targetCount) {
-                incompleteBatches.push({ batch, startPageNum, endPageNum, actualCount: records.length, expectedCount: targetCount });
-              }
             } catch (e) {
-              addLog(`재시도 실패 페이지 ${startPageNum}-${endPageNum}: ${e.message}. 빈 행으로 채웁니다.`, 'error');
-              incompleteBatches.push({ batch, startPageNum, endPageNum, actualCount: 0, expectedCount: batch.length * EXPECTED_PER_PAGE });
+              addLog(`재시도 실패 페이지 ${startPageNum}-${endPageNum}: ${e.message}.`, 'error');
             }
           }
         }
-      }
-
-      // 빈 행 채우기 안내 (실제 채우기는 페이지별 그룹화 후 처리)
-      if (incompleteBatches.length > 0) {
-        const totalEmpty = incompleteBatches.reduce((s, b) => s + (b.expectedCount - b.actualCount), 0);
-        addLog(`⚠ 부족한 ${incompleteBatches.length}개 청크에 총 ${totalEmpty}개 빈 행을 채워 6건/페이지를 맞춥니다.`, 'info');
       }
 
       // 중복 제거 (페이지 경계 중복) — 단, 모든 필드가 비어있으면 중복 검사 제외
       const seen = new Set();
       allRecords = allRecords.filter(r => {
         const key = `${r.startDate}|${r.endDate}|${r.projectName}`;
-        // 빈 키는 중복 검사 제외 (LLM이 비어있는 행을 잘못 추출한 경우, 일단 통과시키고 6건 보정 단계에서 처리)
         if (key === '||' || (!r.startDate && !r.endDate && !r.projectName)) return true;
         if (seen.has(key)) return false;
         seen.add(key); return true;
       });
       addLog(`총 ${allRecords.length}건 추출 (중복 제거 후)`, 'success');
 
-      // 페이지별 6건 보정: 마지막 페이지를 제외한 모든 페이지가 정확히 6건이 되도록 빈 행 추가
+      // 페이지별 보정: LLM이 보고한 periodCount만큼 항목이 있어야 함
+      // 부족하면 빈 행으로 채움 (단, 페이지당 최대 6개 상한)
       const numPages = pageImages.length;
       const recordsByPage = new Map();
       for (let p = 1; p <= numPages; p++) recordsByPage.set(p, []);
@@ -532,14 +584,27 @@ export default function App() {
       for (let p = 1; p <= numPages; p++) {
         const pageRecs = recordsByPage.get(p) || [];
         balancedRecords.push(...pageRecs);
-        const isLastPage = p === numPages;
-        if (!isLastPage && pageRecs.length < EXPECTED_PER_PAGE) {
-          const need = EXPECTED_PER_PAGE - pageRecs.length;
+
+        // 이 페이지의 기대 건수 결정:
+        // 1. LLM이 보고한 periodCount가 있으면 그 값 사용 (단 최대 6 상한)
+        // 2. 없으면 추출된 항목 수 그대로 (보정 안 함)
+        const reported = reportedPeriodCount.get(p);
+        if (reported === undefined) {
+          // periodCount 정보 없음 → 보정하지 않음 (빈 행 추가 안 함)
+          continue;
+        }
+        const expectedForPage = Math.min(reported, MAX_PER_PAGE);
+
+        if (pageRecs.length < expectedForPage) {
+          const need = expectedForPage - pageRecs.length;
           for (let k = 0; k < need; k++) {
             balancedRecords.push(makeEmptyRecord(p));
           }
           totalAddedEmpty += need;
-          addLog(`페이지 ${p}: ${pageRecs.length}건 → 빈 행 ${need}개 추가하여 6건으로 보정`, 'info');
+          addLog(`페이지 ${p}: 추출 ${pageRecs.length}건, 참여기간 ${reported}개 → 빈 행 ${need}개 추가 (목표 ${expectedForPage}건)`, 'info');
+        } else if (pageRecs.length > expectedForPage && reported > 0) {
+          // 추출이 너무 많으면 그대로 둠 (LLM이 헛것을 봤을 수도 있고, 사용자가 검수)
+          addLog(`페이지 ${p}: 추출 ${pageRecs.length}건이 참여기간 ${reported}개보다 많음. 검수 필요.`, 'info');
         }
       }
       if (totalAddedEmpty > 0) {
