@@ -195,6 +195,8 @@ PDF 구조:
 - records 배열에서 같은 pageNumber를 가진 항목 개수가 그 페이지의 periodCount와 **반드시 일치**해야 합니다.
 - 표지(인적사항만 있는 페이지)는 periodCount: 0, records에 해당 pageNumber 없음.
 - 페이지에 참여기간이 5개면 records에서 그 페이지 항목도 5개. 6개면 6개.
+- **이 PDF의 본문 페이지는 항상 정확히 5개 또는 6개의 참여기간을 가집니다. 7개 이상은 절대 불가능합니다.** 만약 7개 이상으로 카운트된다면 표 헤더나 다른 텍스트를 잘못 셌을 가능성이 높으니 다시 한 번 자세히 표의 행만 카운트하세요.
+- 표지(1페이지)만 0개 가능. 본문 페이지(2페이지 이후)는 5 또는 6 중 하나.
 - JSON 객체만 출력하세요. 설명, 마크다운, 주석 모두 금지.`;
 
     // Gemini API 호출 형식: parts 배열 안에 inline_data와 text를 함께 넣음
@@ -423,50 +425,95 @@ PDF 구조:
       const reportedPeriodCount = new Map(); // pageNumber -> periodCount
 
       // 청크 추출 (재시도 포함)
-      // 재시도 조건: 추출된 records의 페이지별 개수가 그 페이지의 periodCount보다 적은 페이지가 있을 때
+      // 검증 규칙:
+      //   - 페이지당 정상 범위는 0~6개 (실제 PDF에선 5개 또는 6개, 표지는 0개)
+      //   - 7개 이상은 LLM이 잘못 인식한 것 → 재시도
+      //   - 추출 수가 LLM이 보고한 periodCount보다 적어도 → 재시도
+      //   - LLM의 periodCount 자체가 7 이상이면 그것도 의심하여 6으로 클램프
+      const VALID_MAX = 6;
+
       const extractWithRetry = async (batch, startPageNum, endPageNum) => {
-        const batchPageNums = batch.map(p => p.page);
         let bestRecords = [];
         let bestStats = [];
-        const maxAttempts = 2; // 첫 시도 + 재시도 1회
+        let bestScore = -1; // 최선의 결과 점수
+        const maxAttempts = 3; // 첫 시도 + 재시도 2회
+
+        // 페이지별 결과의 "정상도" 점수 계산
+        // - 모든 페이지가 정상 범위(0~6)이고 periodCount와 일치 → 가장 높은 점수
+        // - 부족하거나 초과하면 감점
+        const calculateScore = (records, pageStats) => {
+          if (pageStats.length === 0) return records.length; // 정보 없음 → 그냥 개수
+          const recordsByPage = new Map();
+          for (const r of records) {
+            if (!r.pageNumber) continue;
+            recordsByPage.set(r.pageNumber, (recordsByPage.get(r.pageNumber) || 0) + 1);
+          }
+          let score = 0;
+          for (const stat of pageStats) {
+            const actual = recordsByPage.get(stat.pageNumber) || 0;
+            const target = Math.min(stat.periodCount, VALID_MAX); // periodCount도 6으로 클램프
+            if (actual === target) score += 100; // 완전 일치
+            else if (actual > VALID_MAX) score -= 50; // 7개 이상은 큰 감점
+            else if (actual < target) score += 100 - (target - actual) * 20; // 부족할수록 감점
+            else score += 50; // target 초과지만 6 이하 (애매)
+          }
+          return score;
+        };
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           if (cancelRef.current) break;
           const { pageStats, records } = await extractPagesWithClaude(batch, startPageNum);
 
-          // 더 좋은 결과(records 수가 더 많은 결과)를 보존
-          if (records.length > bestRecords.length) {
+          // 점수 기반으로 최선의 결과 선택
+          const score = calculateScore(records, pageStats);
+          if (score > bestScore) {
+            bestScore = score;
             bestRecords = records;
             bestStats = pageStats;
           }
 
-          // 각 페이지의 추출 개수 vs periodCount 비교
+          // 검증: 모든 페이지가 정상 범위 + periodCount와 일치해야 OK
           const recordsByPage = new Map();
           for (const r of records) {
-            const pn = r.pageNumber;
-            if (!pn) continue;
-            recordsByPage.set(pn, (recordsByPage.get(pn) || 0) + 1);
+            if (!r.pageNumber) continue;
+            recordsByPage.set(r.pageNumber, (recordsByPage.get(r.pageNumber) || 0) + 1);
           }
 
-          // 모든 페이지에서 추출 수 >= periodCount면 OK
           let allOK = true;
-          const shortageList = [];
-          for (const stat of pageStats) {
-            const actualCount = recordsByPage.get(stat.pageNumber) || 0;
-            if (actualCount < stat.periodCount) {
+          const issueList = [];
+          // 추출된 페이지별로 검사
+          const allPageNums = new Set([...recordsByPage.keys(), ...pageStats.map(s => s.pageNumber)]);
+          for (const pn of allPageNums) {
+            const actual = recordsByPage.get(pn) || 0;
+            const stat = pageStats.find(s => s.pageNumber === pn);
+            const reportedCount = stat ? stat.periodCount : null;
+            const target = reportedCount !== null ? Math.min(reportedCount, VALID_MAX) : null;
+
+            if (actual > VALID_MAX) {
+              // 7개 이상 → 무조건 재시도
               allOK = false;
-              shortageList.push(`p.${stat.pageNumber}: ${actualCount}/${stat.periodCount}`);
+              issueList.push(`p.${pn}: ${actual}개(과다)`);
+            } else if (target !== null && actual < target) {
+              // 부족 → 재시도
+              allOK = false;
+              issueList.push(`p.${pn}: ${actual}/${target}(부족)`);
+            } else if (reportedCount !== null && reportedCount > VALID_MAX) {
+              // periodCount 자체가 7 이상이면 LLM이 헛것을 본 것 → 재시도
+              allOK = false;
+              issueList.push(`p.${pn}: periodCount ${reportedCount}(과다)`);
             }
           }
-          // pageStats가 비어있다면 LLM이 형식을 안 지킨 것 — 그래도 최소한의 결과는 보존
-          if (pageStats.length === 0 && records.length > 0) allOK = true;
+          // pageStats가 비어있고 records도 정상 범위면 일단 통과
+          if (pageStats.length === 0 && records.length > 0 && records.length <= VALID_MAX * batch.length) {
+            allOK = true;
+          }
 
           if (allOK) {
             return { records: bestRecords, pageStats: bestStats, finalAttempts: attempt };
           }
 
           if (attempt < maxAttempts) {
-            addLog(`⚠ 페이지 ${startPageNum}-${endPageNum} 부족 (${shortageList.join(', ')}). 재시도 (${attempt}/${maxAttempts - 1})...`, 'info');
+            addLog(`⚠ 페이지 ${startPageNum}-${endPageNum} 비정상 (${issueList.join(', ')}). 재시도 (${attempt}/${maxAttempts - 1})...`, 'info');
             await new Promise(r => setTimeout(r, 3000));
           }
         }
@@ -578,19 +625,35 @@ PDF 구조:
         isEmpty: true
       });
 
-      // 페이지 순서대로 다시 합치면서 부족한 곳에 빈 행 추가
+      // 페이지 순서대로 다시 합치면서 보정:
+      //   1. 추출이 7개 이상이면 6개로 잘라냄 (잘못 추출된 것 제거)
+      //   2. periodCount보다 부족하면 빈 행으로 채움 (단 최대 6개 상한)
       const balancedRecords = [];
       let totalAddedEmpty = 0;
+      let totalTrimmed = 0;
       for (let p = 1; p <= numPages; p++) {
-        const pageRecs = recordsByPage.get(p) || [];
+        let pageRecs = recordsByPage.get(p) || [];
+
+        // 1) 7개 이상이면 6개로 잘라냄
+        if (pageRecs.length > MAX_PER_PAGE) {
+          const removed = pageRecs.length - MAX_PER_PAGE;
+          // 빈 행이 섞여 있으면 그것부터 우선 제거, 그 다음 끝에서부터 제거
+          const nonEmpty = pageRecs.filter(r => !r.isEmpty);
+          if (nonEmpty.length <= MAX_PER_PAGE) {
+            pageRecs = nonEmpty.slice(0, MAX_PER_PAGE);
+          } else {
+            pageRecs = nonEmpty.slice(0, MAX_PER_PAGE);
+          }
+          totalTrimmed += removed;
+          addLog(`페이지 ${p}: 추출 ${pageRecs.length + removed}건이 최대 ${MAX_PER_PAGE}건을 초과 → ${removed}건 제거`, 'info');
+        }
+
         balancedRecords.push(...pageRecs);
 
-        // 이 페이지의 기대 건수 결정:
-        // 1. LLM이 보고한 periodCount가 있으면 그 값 사용 (단 최대 6 상한)
-        // 2. 없으면 추출된 항목 수 그대로 (보정 안 함)
+        // 2) 이 페이지의 기대 건수 결정 후 부족하면 빈 행 추가
         const reported = reportedPeriodCount.get(p);
         if (reported === undefined) {
-          // periodCount 정보 없음 → 보정하지 않음 (빈 행 추가 안 함)
+          // periodCount 정보 없음 → 보정하지 않음
           continue;
         }
         const expectedForPage = Math.min(reported, MAX_PER_PAGE);
@@ -602,10 +665,10 @@ PDF 구조:
           }
           totalAddedEmpty += need;
           addLog(`페이지 ${p}: 추출 ${pageRecs.length}건, 참여기간 ${reported}개 → 빈 행 ${need}개 추가 (목표 ${expectedForPage}건)`, 'info');
-        } else if (pageRecs.length > expectedForPage && reported > 0) {
-          // 추출이 너무 많으면 그대로 둠 (LLM이 헛것을 봤을 수도 있고, 사용자가 검수)
-          addLog(`페이지 ${p}: 추출 ${pageRecs.length}건이 참여기간 ${reported}개보다 많음. 검수 필요.`, 'info');
         }
+      }
+      if (totalTrimmed > 0) {
+        addLog(`총 ${totalTrimmed}개 초과 행 제거됨`, 'info');
       }
       if (totalAddedEmpty > 0) {
         addLog(`총 ${totalAddedEmpty}개 빈 행 추가됨. 최종 ${balancedRecords.length}건`, 'success');
@@ -642,6 +705,7 @@ PDF 구조:
   const generateExcelBlob = (records) => {
     const XLSX = window.XLSX;
     const headers = [
+      '추출 페이지', // A열: PDF 어느 페이지에서 추출됐는지
       '착공일(yyyy-MM-dd)', '준공일(yyyy-MM-dd)', '인정일\n숫자만 입력해주세요',
       '참여사업명', '발주자\n발주자 코드값 사용 ex)00001', '공사개요',
       '공사종류\n구분 코드명 사용 ex)전차선로', '전문분야',
@@ -649,14 +713,15 @@ PDF 구조:
       '공사금액(단위,100만원)\n숫자만 입력해주세요', '비고'
     ];
     const rows = records.map(r => [
+      r.pageNumber ? `p.${r.pageNumber}${r.isEmpty ? ' (빈 행)' : ''}` : '', // A열: 페이지 번호
       r.startDate || '', r.endDate || '', r.days || '',
       r.projectName || '', r.ownerCode || '', r.overview || '',
-      r.constructionCode || '', r.specialty || '',  // G열: 공사종류 코드값 (매칭 안 되면 빈칸)
+      r.constructionCode || '', r.specialty || '',
       r.dutyCode || '', r.positionCode || '',
       r.amount || '', r.note || ''
     ]);
     const aoa = [
-      ['모든 항목의 셀서식은 텍스트로 해주셔야 합니다.'],
+      ['모든 항목의 셀서식은 텍스트로 해주셔야 합니다. A열(추출 페이지)은 참고용이니 실제 등록 시 삭제하세요.'],
       headers,
       ...rows
     ];
@@ -669,6 +734,7 @@ PDF 구조:
       }
     }
     ws['!cols'] = [
+      { wch: 14 }, // A: 추출 페이지
       { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 35 }, { wch: 12 }, { wch: 30 },
       { wch: 18 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 14 }, { wch: 20 }
     ];
@@ -1012,6 +1078,7 @@ PDF 구조:
                 <thead className="bg-stone-50 border-b border-stone-200">
                   <tr className="text-stone-600">
                     <th className="px-3 py-2.5 text-left font-medium w-10">#</th>
+                    <th className="px-3 py-2.5 text-left font-medium w-16">페이지</th>
                     <th className="px-3 py-2.5 text-left font-medium">기간</th>
                     <th className="px-3 py-2.5 text-left font-medium">사업명</th>
                     <th className="px-3 py-2.5 text-left font-medium">발주자</th>
@@ -1030,9 +1097,16 @@ PDF 구조:
                           {idx + 1}
                           {r.isEmpty && <div className="text-[9px] text-amber-700 font-medium mt-0.5">빈 행</div>}
                         </td>
+                        <td className="px-3 py-2.5 number-tabular">
+                          {r.pageNumber ? (
+                            <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] ${r.isEmpty ? 'bg-amber-100 text-amber-700' : 'bg-stone-100 text-stone-600'}`}>
+                              p.{r.pageNumber}
+                            </span>
+                          ) : <span className="text-stone-300 text-[10px]">―</span>}
+                        </td>
                         <td className="px-3 py-2.5 number-tabular text-stone-700 whitespace-nowrap">
                           {r.isEmpty ? (
-                            <div className="text-amber-600 text-[10px]">⚠ 추출 실패<br/>(p.{r.pageNumber})</div>
+                            <div className="text-amber-600 text-[10px]">⚠ 추출 실패</div>
                           ) : (
                             <>
                               <div>{r.startDate}</div>
@@ -1063,7 +1137,7 @@ PDF 구조:
                       </tr>
                       {editingIdx === idx && (
                         <tr className="bg-stone-50">
-                          <td colSpan={9} className="px-5 py-4">
+                          <td colSpan={10} className="px-5 py-4">
                             <RecordEditor record={r} codeMaps={codeMaps}
                               onChange={(field, value) => updateRecord(idx, field, value)}
                               onRemap={() => remapRecord(idx)} />
